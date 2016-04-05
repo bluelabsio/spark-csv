@@ -16,14 +16,95 @@
 package com.databricks.spark.csv.util
 
 import java.sql.Timestamp
+import java.util.{Date, Locale}
 import java.text.SimpleDateFormat
 
 import scala.util.control.Exception._
+import scala.util.matching.Regex
+import scala.collection.mutable.HashSet
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types._
 
-private[csv] object InferSchema {
+trait DateMatch {
+  var dates = HashSet[String]()
+  def createDateHash = {
+    val minFourYear = 1700
+    val maxFourYear = 3000
+    val minTwoYear = 0
+    val maxTwoYear = 99 
+      for (year <- minFourYear to maxFourYear) {
+          for (month <- 1 to 12) {
+              for (day <- 1 to 31) {
+                  val date = new StringBuilder()
+                  date.append("%04d".format(year))
+                  date.append("%02d".format(month))
+                  date.append("%02d".format(day))
+                  dates.add(date.toString())
+              }
+          }
+      }
+      for (year <- minFourYear to maxFourYear) {
+          for (month <- 1 to 12) {
+              for (day <- 1 to 31) {
+                  val date = new StringBuilder()
+                  date.append("%02d-".format(day))
+                  date.append("%02d-".format(month))
+                  date.append("%04d".format(year))
+                  dates.add(date.toString())
+              }
+          }
+      }
+      for (year <- minFourYear to maxFourYear) {
+          for (month <- 1 to 12) {
+              for (day <- 1 to 31) {
+                  val date = new StringBuilder()
+                  date.append("%02d/".format(day))
+                  date.append("%02d/".format(month))
+                  date.append("%04d".format(year))
+                  dates.add(date.toString())
+              }
+          }
+      }
+      for (year <- minTwoYear to minTwoYear) {
+          for (month <- 1 to 12) {
+              for (day <- 1 to 31) {
+            val date = new StringBuilder()
+            date.append("%02d".format(year))
+            date.append("%02d".format(month))
+            date.append("%02d".format(day))
+            dates.add(date.toString())
+          }
+        }
+      }
+      for (year <- minTwoYear to minTwoYear) {
+          for (month <- 1 to 12) {
+              for (day <- 1 to 31) {
+            val date = new StringBuilder()
+            date.append("%02d/".format(day))
+            date.append("%02d/".format(month))
+            date.append("%02d".format(year))
+            dates.add(date.toString())
+          }
+        }
+      }
+  }
+  createDateHash
+
+  val dateRegex = Array("([a-zA-z]{3,9})([ ])([0-9]{1,2})([, ])([0-9]{4})".r,
+                   "([0-9]{1,2})([/])([0-9]{1,2})([/])([0-9]{2})".r,
+                   //"([0-9]{1,2})([/])([0-9]{1,2})([/])([0-9]{4})".r,
+                   "([0-9]{1,2})([-])([0-9]{1,2})([-])([0-9]{2})".r,
+                   //"([0-9]{1,2})([-])([0-9]{1,2})([-])([0-9]{4})".r,
+                   "([0-9]{4})([-])([0-9]{1,2})([-])([0-9]{1,2})".r,
+                   "([0-9]{4})([-])([a-zA-z]{3})([-])([0-9]{2})".r,
+                   "([a-zA-z]{3})([-])([0-9]{1,2})([-])([0-9]{4})".r,
+                   "([0-9]{2})([-])([a-zA-z]{3})([-])([0-9]{4})".r)
+}
+
+case class DataStruct(dataType: DataType, dataSize: Integer)
+
+private[csv] object InferSchema extends DateMatch {
 
   /**
    * Similar to the JSON schema inference.
@@ -37,37 +118,42 @@ private[csv] object InferSchema {
       header: Array[String],
       nullValue: String = "",
       dateFormatter: SimpleDateFormat = null): StructType = {
-    val startType: Array[DataType] = Array.fill[DataType](header.length)(NullType)
-    val rootTypes: Array[DataType] = tokenRdd.aggregate(startType)(
+
+    val startType: Array[DataStruct] = Array.fill[DataStruct](header.length)(DataStruct(NullType, 0))
+    val rootTypes: Array[DataStruct] = tokenRdd.aggregate(startType)(
       inferRowType(nullValue, dateFormatter),
       mergeRowTypes)
 
     val structFields = header.zip(rootTypes).map { case (thisHeader, rootType) =>
-      val dType = rootType match {
+      val dType = rootType.dataType match {
         case z: NullType => StringType
         case other => other
       }
-      StructField(thisHeader, dType, nullable = true)
+      val metadata = new MetadataBuilder().putLong("maxlength", rootType.dataSize.toLong).build()
+      StructField(thisHeader, dType, nullable = true, metadata)
     }
 
     StructType(structFields)
   }
 
   private def inferRowType(nullValue: String, dateFormatter: SimpleDateFormat)
-  (rowSoFar: Array[DataType], next: Array[String]): Array[DataType] = {
+  (rowSoFar: Array[DataStruct], next: Array[String]): Array[DataStruct] = {
     var i = 0
     while (i < math.min(rowSoFar.length, next.length)) {  // May have columns on right missing.
-      rowSoFar(i) = inferField(rowSoFar(i), next(i), nullValue, dateFormatter)
+      rowSoFar(i) = DataStruct(inferField(rowSoFar(i).dataType, next(i), nullValue), 
+                               if (rowSoFar(i).dataSize >= next(i).length) rowSoFar(i).dataSize 
+                               else next(i).length)
       i+=1
     }
     rowSoFar
   }
-
   private[csv] def mergeRowTypes(
-      first: Array[DataType],
-      second: Array[DataType]): Array[DataType] = {
-    first.zipAll(second, NullType, NullType).map { case ((a, b)) =>
-      findTightestCommonType(a, b).getOrElse(NullType)
+      first: Array[DataStruct],
+      second: Array[DataStruct]): Array[DataStruct] = {
+    first.zipAll(second, DataStruct(NullType, 0), DataStruct(NullType, 0)).map { case ((a, b)) =>
+      val bestType = findTightestCommonType(a.dataType, b.dataType).getOrElse(NullType)
+      val largestSize = if (a.dataSize >= b.dataSize) a.dataSize else b.dataSize
+      DataStruct(bestType, largestSize)
     }
   }
 
@@ -117,6 +203,21 @@ private[csv] object InferSchema {
       }
     }
 
+    def tryParseDate(field: String): DataType = {
+      var isDate : Boolean = false
+
+      dateRegex.foreach(_.findFirstIn(field).map(d => if (d.length == field.length) isDate = true))
+
+      if (isDate == false)
+        if (dates.contains(field)) isDate = true
+
+      if (isDate == true) {
+        DateType
+      } else {
+        tryParseInteger(field)
+      }
+    }
+
     def tryParseBoolean(field: String): DataType = {
       if ((allCatch opt field.toBoolean).isDefined) {
         BooleanType
@@ -136,7 +237,8 @@ private[csv] object InferSchema {
       typeSoFar
     } else {
       typeSoFar match {
-        case NullType => tryParseInteger(field)
+        case NullType => tryParseDate(field)
+        case DateType => tryParseDate(field)
         case IntegerType => tryParseInteger(field)
         case LongType => tryParseLong(field)
         case DoubleType => tryParseDouble(field)
@@ -157,6 +259,7 @@ private[csv] object InferSchema {
     IndexedSeq[DataType](
       ByteType,
       ShortType,
+      DateType,
       IntegerType,
       LongType,
       FloatType,
